@@ -151,3 +151,5 @@ litellm.log
 
 .coverage-rust
 coverage-rust.xml
+
+litellm-proxy-extras/litellm_proxy_extras/ui/
