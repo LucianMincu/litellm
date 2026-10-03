@@ -1,6 +1,5 @@
 import json
 import os
-from importlib.resources import files as package_files
 from typing import Final
 
 import pytest
@@ -117,7 +116,7 @@ class TestMCPRegistryFile:
         with open(registry_path, "r") as f:
             data = json.load(f)
         proxy_dir: Final = os.path.dirname(registry_path)
-        built_logos_dir: Final = str(package_files("litellm_proxy_extras").joinpath("ui", "assets", "logos"))
+        built_logos_dir: Final = os.path.join(proxy_dir, "_experimental", "out", "assets", "logos")
         source_logos_dir: Final = os.path.join(
             proxy_dir, "..", "..", "ui", "litellm-dashboard", "public", "assets", "logos"
         )
