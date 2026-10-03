@@ -184,17 +184,16 @@ def check_aws_feature_guidance() -> str:
 
 def check_ui_packaging(profile: str) -> str:
     sdk_files: Final = distribution("litellm").files or ()
-    bundled_ui: Final = tuple(
-        str(path) for path in sdk_files if str(path).startswith("litellm/proxy/_experimental/out/")
+    _require(
+        any(str(path) == "litellm/proxy/_experimental/out/index.html" for path in sdk_files),
+        "SDK wheel is missing the bundled dashboard",
     )
-    _require(not bundled_ui, "core SDK still bundles dashboard assets")
+    ui: Final = files("litellm").joinpath("proxy/_experimental/out")
+    _require(ui.joinpath("index.html").is_file(), "SDK wheel is missing the dashboard entrypoint")
+    _require(ui.joinpath("_next").is_dir(), "SDK wheel is missing Next.js assets")
     has_proxy_extras: Final = importlib.util.find_spec("litellm_proxy_extras") is not None
     _require(has_proxy_extras == (profile == "proxy"), f"unexpected proxy extras installation for {profile}")
-    if profile == "proxy":
-        ui: Final = files("litellm_proxy_extras").joinpath("ui")
-        _require(ui.joinpath("index.html").is_file(), "proxy wheel is missing the dashboard entrypoint")
-        _require(ui.joinpath("_next").is_dir(), "proxy wheel is missing Next.js assets")
-    return "dashboard assets are installed only with the proxy extra"
+    return "dashboard assets remain bundled with the SDK"
 
 
 def check_proxy_ui() -> str:
@@ -208,7 +207,7 @@ def check_proxy_ui() -> str:
     client: Final = TestClient(app)
     favicon: Final = client.get("/get_favicon")
     _require(favicon.status_code == 200, "default favicon is unavailable")
-    _require(favicon.content == files("litellm_proxy_extras").joinpath("ui/favicon.ico").read_bytes(), "wrong favicon")
+    _require(favicon.content == files("litellm").joinpath("proxy/_experimental/out/favicon.ico").read_bytes(), "wrong favicon")
     for route in ("", "login/"):
         response: Final = client.get(f"/ui/{route}")
         _require(response.status_code == 200, f"dashboard route {route!r} returned {response.status_code}")
@@ -224,11 +223,6 @@ def check_proxy_ui() -> str:
                 asset_response.status_code == 200, f"dashboard asset {relative} returned {asset_response.status_code}"
             )
             _require(asset_response.content == asset.read_bytes(), f"wrong dashboard asset content for {relative}")
-    for case in ("ready", "unstructured", "empty", "unset"):
-        subprocess.run(
-            [sys.executable, "-I", str(Path(__file__).with_name("check_custom_ui.py")), case],
-            check=True,
-        )
     return "installed proxy serves dashboard, nested routes, JavaScript and CSS"
 
 

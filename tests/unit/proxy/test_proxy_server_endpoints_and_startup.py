@@ -750,7 +750,7 @@ def test_ui_extensionless_route_requires_restructure(tmp_path):
 
 
 def test_admin_ui_export_serves_nested_extensionless_routes():
-    out_dir = Path(proxy_server_module.packaged_ui_path)
+    out_dir = Path(litellm.__file__).parent / "proxy" / "_experimental" / "out"
     assert out_dir.is_dir(), f"missing UI export at {out_dir}"
 
     nested_html_offenders = [

@@ -10,9 +10,7 @@ to avoid long module load times during testing.
 
 import os
 import tempfile
-from importlib.resources import files
 from pathlib import Path
-from typing import Final
 from unittest import mock
 
 import pytest
@@ -147,28 +145,6 @@ class TestUIDetectionLogic:
 
             # Restore permissions for cleanup
             os.chmod(readonly_dir, 0o755)
-
-
-def test_proxy_serves_dashboard_from_extras_package() -> None:
-    from fastapi.testclient import TestClient
-    from litellm.proxy.proxy_server import app, packaged_ui_path
-
-    expected: Final = files("litellm_proxy_extras").joinpath("ui")
-    assert packaged_ui_path is not None
-    assert Path(packaged_ui_path) == Path(str(expected))
-    client: Final = TestClient(app)
-    response: Final = client.get("/ui/")
-    assert response.status_code == 200, response.text
-    assert response.content == expected.joinpath("index.html").read_bytes()
-    login: Final = client.get("/ui/login/")
-    assert login.status_code == 200, login.text
-    assert login.content == expected.joinpath("login", "index.html").read_bytes()
-    asset: Final = next(Path(str(expected)).joinpath("_next").rglob("*.js"))
-    asset_path: Final = asset.relative_to(Path(str(expected))).as_posix()
-    for prefix in ("", "/litellm-asset-prefix"):
-        javascript: Final = client.get(f"{prefix}/{asset_path}")
-        assert javascript.status_code == 200
-        assert javascript.content == asset.read_bytes()
 
 
 if __name__ == "__main__":
