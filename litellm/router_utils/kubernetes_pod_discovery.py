@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import ipaddress
 import socket
 import threading
@@ -16,6 +17,7 @@ from litellm._logging import verbose_router_logger
 from litellm.constants import (
     KUBERNETES_POD_DISCOVERY_IDLE_EVICTION_SECONDS,
     KUBERNETES_POD_DISCOVERY_REFRESH_INTERVAL_SECONDS,
+    SESSION_ID_GENERATED_METADATA_KEY,
 )
 
 _SocketAddress: TypeAlias = tuple[str, int] | tuple[str, int, int, int] | tuple[int, bytes]
@@ -68,48 +70,84 @@ class KubernetesPodDiscovery:
             self._refreshing = self._refreshing | {key}
             return None, True
 
-    def resolve_deployment(self, deployment: _DeploymentT) -> _DeploymentT:
+    def resolve_deployment(
+        self,
+        deployment: _DeploymentT,
+        request_kwargs: Mapping[str, object] | None = None,
+    ) -> _DeploymentT:
         eligible: Final = self._eligible(deployment)
         if eligible is None:
             return deployment
         url, key, deployment_mapping = eligible
         host, port = key
         now: Final = self.clock()
+        session_id: Final = self._session_id(request_kwargs)
         cached, should_refresh = self._begin_refresh(key, now)
         if cached is not None:
-            return self._deployment_with_cached_ip(deployment, deployment_mapping, key, url, now)
+            return self._deployment_with_cached_ip(deployment, deployment_mapping, key, url, now, session_id)
         if not should_refresh:
             return deployment
 
         try:
             records: Final = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
         except OSError as error:
-            return self._apply_lookup(deployment, deployment_mapping, key, url, error, now)
+            return self._apply_lookup(deployment, deployment_mapping, key, url, error, now, session_id)
         else:
-            return self._apply_lookup(deployment, deployment_mapping, key, url, records, now)
+            return self._apply_lookup(deployment, deployment_mapping, key, url, records, now, session_id)
         finally:
             with self._lock:
                 self._refreshing = self._refreshing - {key}
 
-    async def async_resolve_deployment(self, deployment: _DeploymentT) -> _DeploymentT:
+    async def async_resolve_deployment(
+        self,
+        deployment: _DeploymentT,
+        request_kwargs: Mapping[str, object] | None = None,
+    ) -> _DeploymentT:
         eligible: Final = self._eligible(deployment)
         if eligible is None:
             return deployment
         url, key, deployment_mapping = eligible
         host, port = key
         now: Final = self.clock()
+        session_id: Final = self._session_id(request_kwargs)
         cached, should_refresh = self._begin_refresh(key, now)
         if cached is not None:
-            return self._deployment_with_cached_ip(deployment, deployment_mapping, key, url, now)
+            return self._deployment_with_cached_ip(deployment, deployment_mapping, key, url, now, session_id)
         if not should_refresh:
             return deployment
 
         try:
             result: Final = await self._async_getaddrinfo(host, port)
-            return self._apply_lookup(deployment, deployment_mapping, key, url, result, now)
+            return self._apply_lookup(deployment, deployment_mapping, key, url, result, now, session_id)
         finally:
             with self._lock:
                 self._refreshing = self._refreshing - {key}
+
+    @staticmethod
+    def _session_id(request_kwargs: Mapping[str, object] | None) -> str | None:
+        if request_kwargs is None:
+            return None
+        metadata_dicts: Final = tuple(
+            cast(Mapping[str, object], metadata)  # cast-ok: runtime dict check precedes metadata lookup
+            for metadata in (request_kwargs.get("litellm_metadata"), request_kwargs.get("metadata"))
+            if isinstance(metadata, dict)
+        )
+        if any(metadata.get(SESSION_ID_GENERATED_METADATA_KEY) for metadata in metadata_dicts):
+            return None
+        metadata_session_id: Final = next(
+            (
+                session_id
+                for metadata in metadata_dicts
+                if (session_id := metadata.get("session_id")) is not None and session_id != ""
+            ),
+            None,
+        )
+        if metadata_session_id is not None:
+            return str(metadata_session_id)
+        top_level_session_id: Final = request_kwargs.get("litellm_session_id")
+        if top_level_session_id is None or top_level_session_id == "":
+            return None
+        return str(top_level_session_id)
 
     def _eligible(self, deployment: object) -> tuple[httpx.URL, _CacheKey, Mapping[str, object]] | None:
         if not isinstance(deployment, Mapping):
@@ -164,6 +202,7 @@ class KubernetesPodDiscovery:
         url: httpx.URL,
         result: Sequence[_AddressInfo] | OSError,
         now: float,
+        session_id: str | None,
     ) -> _DeploymentT:
         if isinstance(result, OSError):
             if isinstance(result, socket.gaierror) and self._is_authoritative_no_pods(result):
@@ -171,12 +210,12 @@ class KubernetesPodDiscovery:
                 return deployment
             self._stamp_failed_refresh(key, self.clock())
             verbose_router_logger.debug("Kubernetes pod discovery DNS refresh failed for %s: %s", key[0], result)
-            return self._deployment_with_cached_ip(deployment, deployment_mapping, key, url, now)
+            return self._deployment_with_cached_ip(deployment, deployment_mapping, key, url, now, session_id)
         ips: Final = self._pod_ips(result)
         self._store(key, ips, self.clock())
         if not ips:
             return deployment
-        return self._deployment_with_cached_ip(deployment, deployment_mapping, key, url, now)
+        return self._deployment_with_cached_ip(deployment, deployment_mapping, key, url, now, session_id)
 
     @staticmethod
     def _is_ip_literal(host: str) -> bool:
@@ -218,13 +257,23 @@ class KubernetesPodDiscovery:
             if cached is not None:
                 self._cache = MappingProxyType({**self._cache, key: replace(cached, resolved_at=resolved_at)})
 
-    def _next_ip(self, key: _CacheKey, now: float) -> str | None:
+    def _next_ip(self, key: _CacheKey, now: float, session_id: str | None) -> str | None:
         with self._lock:
             cached: Final = self._cache.get(key)
             if cached is None or not cached.ips:
                 return None
-            ip: Final = cached.ips[cached.cursor]
-            next_cursor: Final = (cached.cursor + 1) % len(cached.ips)
+            ip: Final = (
+                cached.ips[cached.cursor]
+                if session_id is None
+                else max(
+                    cached.ips,
+                    key=lambda address: int.from_bytes(
+                        hashlib.blake2b(f"{session_id}\x00{address}".encode(), digest_size=8).digest(),
+                        "big",
+                    ),
+                )
+            )
+            next_cursor: Final = (cached.cursor + 1) % len(cached.ips) if session_id is None else cached.cursor
             self._cache = MappingProxyType(
                 {
                     **self._cache,
@@ -240,8 +289,9 @@ class KubernetesPodDiscovery:
         key: _CacheKey,
         url: httpx.URL,
         now: float,
+        session_id: str | None,
     ) -> _DeploymentT:
-        ip: Final = self._next_ip(key, now)
+        ip: Final = self._next_ip(key, now, session_id)
         if ip is None:
             return deployment
         if self._proxy_bypasses_only_service_host(key[0], ip):
@@ -304,13 +354,25 @@ _R = TypeVar("_R")
 _S = TypeVar("_S", bound=_HasPodDiscovery)
 
 
+def _mapping_request_kwargs(request_kwargs: object) -> Mapping[str, object] | None:
+    if not isinstance(request_kwargs, Mapping):
+        return None
+    return cast(  # cast-ok: router selector request kwargs use string keys
+        Mapping[str, object],
+        request_kwargs,
+    )
+
+
 def resolve_pods_after(
     fn: Callable[Concatenate[_S, _P], _R],
 ) -> Callable[Concatenate[_S, _P], _R]:
     @wraps(fn)
     def wrapped(self: _S, *args: _P.args, **kwargs: _P.kwargs) -> _R:
         deployment: Final = fn(self, *args, **kwargs)
-        return self.kubernetes_pod_discovery.resolve_deployment(deployment)
+        return self.kubernetes_pod_discovery.resolve_deployment(
+            deployment,
+            _mapping_request_kwargs(kwargs.get("request_kwargs")),
+        )
 
     return wrapped
 
@@ -321,7 +383,10 @@ def async_resolve_pods_after(
     @wraps(fn)
     async def wrapped(self: _S, *args: _P.args, **kwargs: _P.kwargs) -> _R:
         deployment: Final = await fn(self, *args, **kwargs)
-        return await self.kubernetes_pod_discovery.async_resolve_deployment(deployment)
+        return await self.kubernetes_pod_discovery.async_resolve_deployment(
+            deployment,
+            _mapping_request_kwargs(kwargs.get("request_kwargs")),
+        )
 
     return wrapped
 
@@ -333,7 +398,10 @@ def resolve_pods_after_bound(
     @wraps(fn)
     def wrapped(*args: _P.args, **kwargs: _P.kwargs) -> _R:
         deployment: Final = fn(*args, **kwargs)
-        return discovery.resolve_deployment(deployment)
+        return discovery.resolve_deployment(
+            deployment,
+            _mapping_request_kwargs(kwargs.get("request_kwargs")),
+        )
 
     return wrapped
 
@@ -345,6 +413,9 @@ def async_resolve_pods_after_bound(
     @wraps(fn)
     async def wrapped(*args: _P.args, **kwargs: _P.kwargs) -> _R:
         deployment: Final = await fn(*args, **kwargs)
-        return await discovery.async_resolve_deployment(deployment)
+        return await discovery.async_resolve_deployment(
+            deployment,
+            _mapping_request_kwargs(kwargs.get("request_kwargs")),
+        )
 
     return wrapped
